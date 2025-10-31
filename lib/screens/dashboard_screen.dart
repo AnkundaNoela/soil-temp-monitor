@@ -1,14 +1,26 @@
 import 'package:flutter/material.dart';
+import 'package:soil_temp_monitor/services/insights_dashboard.dart';
 import 'package:syncfusion_flutter_charts/charts.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../widgets/sidebar_menu.dart';
+import 'package:intl/intl.dart';
+import '../models/temperature_reading.dart';
+import '../widgets/chatbot_widget.dart';
+
+// NEW SERVICE IMPORTS
+import '../services/alerts_service.dart';
+import '../services/soil_health_service.dart';
+import '../services/weather_service.dart';
+import '../services/bluetooth_manager.dart'; // <--- IMPORTANT: Singleton Manager
+
+
+// The next classes (DashboardScreen, _DashboardScreenState) are now decoupled
+// from the direct BLE hardware management.
 
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
@@ -18,305 +30,184 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  // BLE Configuration - Match your Arduino code
-  static const String SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-  static const String CHARACTERISTIC_UUID_TX =
-      "beb5483e-36e1-4688-b7f5-ea07361b26a9";
-  static const String CHARACTERISTIC_UUID_RX =
-      "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+  // --- PERSISTENT STATE MANAGER INSTANCE ---
+  // Access the single instance of the BluetoothManager
+  final BluetoothManager _bleManager = BluetoothManager();
 
-  // BLE Objects
-  BluetoothDevice? connectedDevice;
-  BluetoothCharacteristic? txCharacteristic;
-  BluetoothCharacteristic? rxCharacteristic;
-  StreamSubscription<List<int>>? notificationSubscription;
-
-  // Temperature data
+  // --- LOCAL STATE VARIABLES (MIRRORED FROM MANAGER) ---
   double currentTemp = 0.00;
   List<TemperatureReading> readings = [];
   String selectedChartType = 'line';
   int selectedTimeRange = 7;
+  // BLE status is now pulled from manager's streams/state
   bool isConnected = false;
   bool isScanning = false;
   String connectionStatus = "Not Connected";
 
+  // INSIGHTS STATE VARIABLES
+  double ambientTemp = 0.0;
+  double tempTrend = 0.0;
+  double soilHealthScore = 0.0;
+  String? alertMessage;
+  List<ForecastDay> forecastDays = [];
+
+  // SERVICES
+  final AlertsService _alertsService = AlertsService();
+  final SoilHealthService _healthService = SoilHealthService();
+  final WeatherService _weatherService = WeatherService();
+
+  // Stream Subscriptions to update UI when manager state changes
+  StreamSubscription? _statusSubscription;
+  StreamSubscription? _tempSubscription;
+
   @override
   void initState() {
     super.initState();
-    _initializeBluetooth();
-    _loadHistoricalData();
+
+    // 1. Initial State Load
+    // Load the current data/status immediately from the manager's state
+    readings = _bleManager.readings.cast<TemperatureReading>();
+    currentTemp = _bleManager.currentTemp;
+    connectionStatus = _bleManager.connectionStatus;
+    isConnected = _bleManager.isConnected;
+    isScanning = _bleManager.isScanning;
+
+    // 2. Initial Setup/Scan (Only triggered by the manager if it hasn't run yet)
+    // This is the call that ensures scan ONLY happens on app launch
+    _bleManager.initialize();
+
+    // 3. Subscribe to Manager's Streams for persistent UI updates
+    _statusSubscription = _bleManager.connectionStatusStream.listen((status) {
+      if (mounted) {
+        setState(() {
+          connectionStatus = status;
+          isConnected = _bleManager.isConnected;
+          isScanning = _bleManager.isScanning;
+        });
+      }
+    });
+
+    _tempSubscription = _bleManager.temperatureStream.listen((temp) {
+      if (mounted) {
+        setState(() {
+          currentTemp = temp;
+          readings = _bleManager.readings
+              .cast<TemperatureReading>(); // Get the updated full list
+        });
+        _updateInsights(); // Recalculate insights on new temperature data
+      }
+    });
+
+    // 4. Initial Load of Insights (including Weather API call)
+    _updateInsights();
   }
 
   @override
   void dispose() {
-    notificationSubscription?.cancel();
+    // ONLY cancel subscriptions! DO NOT dispose of the manager.
+    _statusSubscription?.cancel();
+    _tempSubscription?.cancel();
     super.dispose();
   }
 
   // ============================================
-  // BLUETOOTH INITIALIZATION
+  // INSIGHTS & CALCULATION LOGIC
   // ============================================
-  Future<void> _initializeBluetooth() async {
-    // Request permissions
-    if (Platform.isAndroid) {
-      await Permission.bluetoothScan.request();
-      await Permission.bluetoothConnect.request();
-      await Permission.location.request();
-    }
 
-    // Check if Bluetooth is available
-    try {
-      final isAvailable = await FlutterBluePlus.isSupported;
-      if (!isAvailable) {
-        _showError("Bluetooth not available on this device");
-        return;
-      }
+  // Helper to calculate the temperature trend over the last hour
+  double _calculateTemperatureTrend() {
+    if (readings.length < 2) return 0.0;
 
-      // Check if Bluetooth is on
-      final adapterState = await FlutterBluePlus.adapterState.first;
-      if (adapterState != BluetoothAdapterState.on) {
-        _showError("Please turn on Bluetooth");
-        return;
-      }
+    // Find a reading from approximately 1 hour ago
+    final oneHourAgo = DateTime.now().subtract(const Duration(hours: 1));
+    final readingsOneHour = readings
+        .where((r) => r.timestamp.isAfter(oneHourAgo))
+        .toList();
 
-      // Auto-connect to ESP32
-      await _scanAndConnect();
-    } catch (e) {
-      _showError("Bluetooth initialization failed: $e");
+    if (readingsOneHour.length < 2) return 0.0;
+
+    final oldReading = readingsOneHour.first;
+    final newReading = readingsOneHour.last;
+
+    // Time difference in hours
+    final timeDifferenceHours =
+        newReading.timestamp.difference(oldReading.timestamp).inMinutes / 60.0;
+
+    if (timeDifferenceHours < 0.1) return 0.0; // Prevent division by near-zero
+
+    // Calculate trend per day (°C/day)
+    final tempDiff = newReading.temperature - oldReading.temperature;
+    final trendPerDay = (tempDiff / timeDifferenceHours) * 24.0;
+
+    return trendPerDay;
+  }
+
+  Future<void> _updateInsights() async {
+    if (readings.isEmpty) return;
+
+    // 1. Calculate Trend (for Alerts and Crop Recommendations)
+    final trend = _calculateTemperatureTrend();
+
+    // 2. Calculate Health Score (using last 24 hours of readings)
+    final recentTemps = readings
+        .where(
+          (r) => r.timestamp.isAfter(
+        DateTime.now().subtract(const Duration(hours: 24)),
+      ),
+    )
+        .map((r) => r.temperature)
+        .toList();
+    final healthScore = _healthService.calculateHealthScore(recentTemps);
+
+    // 3. Fetch Weather Data (Makerere University, Uganda)
+    const double lat = 0.31361;
+    const double lon = 32.58111;
+
+    final forecast = await _weatherService.getForecast(
+      lat,
+      lon,
+    ); // Fetch 3-day forecast (with hourly data)
+    final temp = await _weatherService.getAmbientTemperature(
+      lat,
+      lon,
+    ); // Fetch current ambient temp
+
+    // 4. Check Alerts & Predictions
+    final alert = _alertsService.checkTemperatureAlerts(
+      currentTemp,
+      temp ?? ambientTemp,
+    );
+    final message = alert ?? _alertsService.predictTrend(trend);
+
+    if (mounted) {
+      // Only call setState if the widget is still mounted
+      setState(() {
+        tempTrend = trend;
+        soilHealthScore = healthScore;
+        ambientTemp = temp ?? ambientTemp;
+        alertMessage = message;
+        forecastDays = forecast; // Update state with full forecast data
+      });
     }
   }
 
   // ============================================
-  // SCAN AND CONNECT TO ESP32
+  // BLUETOOTH/DB/COMMAND LOGIC (REPLACED WITH MANAGER CALLS)
   // ============================================
-  Future<void> _scanAndConnect() async {
-    setState(() {
-      isScanning = true;
-      connectionStatus = "Scanning...";
-    });
 
-    try {
-      // Start scanning
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+  // Trigger the Singleton's scan method
 
-      // Listen for devices
-      var subscription = FlutterBluePlus.scanResults.listen((results) async {
-        for (ScanResult result in results) {
-          // Look for ESP32_Soil_Sensor_BLE device
-          if (result.device.platformName.contains("ESP32_Soil_Sensor_BLE") ||
-              result.advertisementData.serviceUuids.any(
-                (uuid) =>
-                    uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase(),
-              )) {
-            // Stop scanning
-            await FlutterBluePlus.stopScan();
-
-            // Connect to device
-            await _connectToDevice(result.device);
-            break;
-          }
-        }
-      });
-
-      // Wait for scan to complete
-      await Future.delayed(const Duration(seconds: 10));
-      subscription.cancel();
-
-      if (!isConnected) {
-        setState(() {
-          connectionStatus = "ESP32 not found";
-          isScanning = false;
-        });
-        _showError("ESP32 sensor not found. Make sure it's powered on.");
-      }
-    } catch (e) {
-      setState(() {
-        isScanning = false;
-        connectionStatus = "Scan failed";
-      });
-      _showError("Scan failed: $e");
-    }
-  }
-
-  // ============================================
-  // CONNECT TO ESP32 DEVICE
-  // ============================================
-  Future<void> _connectToDevice(BluetoothDevice device) async {
-    try {
-      setState(() {
-        connectionStatus = "Connecting...";
-      });
-
-      // Connect to device
-      await device.connect(
-        timeout: const Duration(seconds: 15),
-        license: License.free, // ← Required parameter
-      );
-
-      setState(() {
-        connectedDevice = device;
-        isConnected = true;
-        connectionStatus = "Connected";
-        isScanning = false;
-      });
-
-      // Discover services
-      List<BluetoothService> services = await device.discoverServices();
-
-      for (BluetoothService service in services) {
-        if (service.uuid.toString().toLowerCase() ==
-            SERVICE_UUID.toLowerCase()) {
-          for (BluetoothCharacteristic characteristic
-              in service.characteristics) {
-            // TX Characteristic (receives temperature from ESP32)
-            if (characteristic.uuid.toString().toLowerCase() ==
-                CHARACTERISTIC_UUID_TX.toLowerCase()) {
-              txCharacteristic = characteristic;
-
-              // Enable notifications
-              await characteristic.setNotifyValue(true);
-
-              // Listen for temperature updates
-              notificationSubscription = characteristic.onValueReceived.listen((
-                value,
-              ) {
-                _handleTemperatureUpdate(value);
-              });
-
-              print("✅ Subscribed to temperature notifications");
-            }
-
-            // RX Characteristic (sends commands to ESP32)
-            if (characteristic.uuid.toString().toLowerCase() ==
-                CHARACTERISTIC_UUID_RX.toLowerCase()) {
-              rxCharacteristic = characteristic;
-              print("✅ Found RX characteristic for commands");
-            }
-          }
-        }
-      }
-
-      _showSuccess("Connected to ESP32 Sensor!");
-    } catch (e) {
-      setState(() {
-        isConnected = false;
-        connectionStatus = "Connection failed";
-        isScanning = false;
-      });
-      _showError("Connection failed: $e");
-    }
-  }
-
-  // ============================================
-  // HANDLE TEMPERATURE UPDATES FROM ESP32
-  // ============================================
-  void _handleTemperatureUpdate(List<int> value) {
-    try {
-      // Convert bytes to string
-      String tempString = utf8.decode(value);
-
-      // Parse temperature (format: "24.5 °C")
-      String numericPart = tempString.replaceAll(RegExp(r'[^0-9.]'), '');
-      double temperature = double.parse(numericPart);
-
-      setState(() {
-        currentTemp = temperature;
-        readings.add(
-          TemperatureReading(
-            timestamp: DateTime.now(),
-            temperature: temperature,
-          ),
-        );
-
-        // Keep last 500 readings
-        if (readings.length > 500) {
-          readings.removeAt(0);
-        }
-      });
-
-      // Save to database
-      _saveReadingToDatabase(temperature);
-
-      print("🌡️ Temperature received: $temperature°C");
-    } catch (e) {
-      print("Error parsing temperature: $e");
-    }
-  }
-
-  // ============================================
-  // SEND COMMANDS TO ESP32
-  // ============================================
+  // Trigger the Singleton's command method
   Future<void> _sendCommand(String command) async {
-    if (rxCharacteristic == null || !isConnected) {
+    await _bleManager.sendCommand(command);
+    if (!_bleManager.isConnected) {
       _showError("Not connected to ESP32");
-      return;
-    }
-
-    try {
-      await rxCharacteristic!.write(utf8.encode(command));
-      print("📤 Sent command: $command");
+    } else {
       _showSuccess("Command sent: $command");
-    } catch (e) {
-      _showError("Failed to send command: $e");
     }
   }
 
-  // ============================================
-  // DATABASE OPERATIONS
-  // ============================================
-  Future<void> _saveReadingToDatabase(double temperature) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      List<String> savedReadings =
-          prefs.getStringList('temperature_readings') ?? [];
-
-      final reading = jsonEncode({
-        'timestamp': DateTime.now().toIso8601String(),
-        'temperature': temperature,
-      });
-
-      savedReadings.add(reading);
-
-      // Keep only last 1000 readings to save space
-      if (savedReadings.length > 1000) {
-        savedReadings = savedReadings.sublist(savedReadings.length - 1000);
-      }
-
-      await prefs.setStringList('temperature_readings', savedReadings);
-    } catch (e) {
-      print('Error saving to database: $e');
-    }
-  }
-
-  Future<void> _loadHistoricalData() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      List<String> savedReadings =
-          prefs.getStringList('temperature_readings') ?? [];
-
-      setState(() {
-        readings = savedReadings.map((str) {
-          final data = jsonDecode(str);
-          return TemperatureReading(
-            timestamp: DateTime.parse(data['timestamp']),
-            temperature: data['temperature'].toDouble(),
-          );
-        }).toList();
-
-        if (readings.isNotEmpty) {
-          currentTemp = readings.last.temperature;
-        }
-      });
-
-      print('✅ Loaded ${readings.length} historical readings');
-    } catch (e) {
-      print('Error loading historical data: $e');
-    }
-  }
-
-  // ============================================
-  // QUICK ACTIONS
-  // ============================================
+  // Used for manual input, calls the manager's public method
   void _addManualReading() {
     showDialog(
       context: context,
@@ -341,15 +232,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
               onPressed: () {
                 final temp = double.tryParse(controller.text);
                 if (temp != null) {
-                  setState(() {
-                    readings.add(
-                      TemperatureReading(
-                        timestamp: DateTime.now(),
-                        temperature: temp,
-                      ),
-                    );
-                    currentTemp = temp;
-                  });
+                  // CORRECTED: Call the now-public method 'handleTemperatureUpdate'
+                  _bleManager.handleTemperatureUpdate(
+                    utf8.encode(temp.toStringAsFixed(2) + " °C"),
+                  );
                   Navigator.pop(context);
                   _showSuccess('Reading added successfully');
                 }
@@ -366,7 +252,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) => HistoryScreen(readings: readings),
+        builder: (context) => HistoryScreen(
+          readings: _bleManager.readings,
+        ), // Use manager's persistent list
       ),
     );
   }
@@ -376,7 +264,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _showError('No data to export');
       return;
     }
-
+    // ... (rest of export logic remains the same, using local 'readings' which is mirrored) ...
     try {
       List<List<dynamic>> csvData = [
         ['Date', 'Time', 'Temperature (°C)'],
@@ -416,23 +304,25 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _showError('No readings available to share');
       return;
     }
-
+    // ... (rest of share logic remains the same) ...
     final avg24h = _calculateAverage(24);
     final min24h = _calculateMin(24);
     final max24h = _calculateMax(24);
     final readingCount = readings
         .where(
           (r) => r.timestamp.isAfter(
-            DateTime.now().subtract(const Duration(hours: 24)),
-          ),
-        )
+        DateTime.now().subtract(const Duration(hours: 24)),
+      ),
+    )
         .length;
 
     final summary =
-        '''
+    '''
 📊 Temperature Sensor Report
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-🌡️ Current: ${currentTemp.toStringAsFixed(2)}°C
+🌡️ Current Soil Temp: ${currentTemp.toStringAsFixed(2)}°C
+☀️ Current Ambient Temp: ${ambientTemp.toStringAsFixed(1)}°C
+🌱 Soil Health Score: ${soilHealthScore.toStringAsFixed(0)}/100
 📅 ${DateTime.now().toString().split('.')[0]}
 
 📈 Last 24 Hours:
@@ -442,14 +332,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
    • Readings: $readingCount
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-ESP32 Temperature Monitor
+${alertMessage ?? "All systems nominal."}
 ''';
 
     await Share.share(summary, subject: 'Temperature Reading');
   }
 
   // ============================================
-  // STATISTICS CALCULATIONS
+  // STATISTICS CALCULATIONS (Unchanged)
   // ============================================
   double _calculateAverage(int hours) {
     final cutoff = DateTime.now().subtract(Duration(hours: hours));
@@ -484,7 +374,7 @@ ESP32 Temperature Monitor
   }
 
   // ============================================
-  // UI HELPERS
+  // UI HELPERS (Unchanged)
   // ============================================
   void _showError(String message) {
     if (mounted) {
@@ -503,7 +393,7 @@ ESP32 Temperature Monitor
   }
 
   // ============================================
-  // BUILD UI
+  // BUILD UI (MODIFIED: Replaced individual cards with FullWeatherCard)
   // ============================================
   @override
   Widget build(BuildContext context) {
@@ -521,9 +411,8 @@ ESP32 Temperature Monitor
                   : Icons.bluetooth_disabled,
             ),
             onPressed: () {
-              if (!isConnected) {
-                _scanAndConnect();
-              }
+              // Navigate to Bluetooth connection screen
+              Navigator.pushNamed(context, '/bluetooth');
             },
           ),
           IconButton(
@@ -534,6 +423,7 @@ ESP32 Temperature Monitor
           ),
         ],
       ),
+      floatingActionButton: const ChatbotFAB(),
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
@@ -551,8 +441,10 @@ ESP32 Temperature Monitor
               children: [
                 _buildConnectionCard(),
                 const SizedBox(height: 20),
-                _buildCurrentTempCard(),
+
+                _buildFullWeatherCard(),
                 const SizedBox(height: 20),
+
                 _buildStatisticsCards(),
                 const SizedBox(height: 24),
                 _buildGraphCard(),
@@ -568,53 +460,372 @@ ESP32 Temperature Monitor
     );
   }
 
-  Widget _buildConnectionCard() {
+  // ============================================
+  // WIDGETS (Rely on local state, which is mirrored from the Manager)
+  // ============================================
+
+  Widget _buildFullWeatherCard() {
+    if (forecastDays.isEmpty || readings.isEmpty) {
+      // Fallback if data is missing
+      return Column(
+        children: [
+          _buildCurrentTempCard(),
+          const SizedBox(height: 20),
+          _buildAlertsCard(),
+          const SizedBox(height: 20),
+        ],
+      );
+    }
+
+    final currentDay = forecastDays.first;
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: isConnected ? Colors.green.shade50 : Colors.orange.shade50,
+        color: Colors.green.shade50,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.15),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          _buildCurrentSummary(currentDay.maxTempC, currentDay.minTempC),
+          const SizedBox(height: 16),
+
+          _buildHourlyForecast(currentDay.hourlyForecast),
+          const SizedBox(height: 16),
+
+          _buildDailyForecastList(),
+          const SizedBox(height: 16),
+
+          _buildCombinedInsightBar(ambientTemp),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCurrentSummary(double maxTemp, double minTemp) {
+    return Column(
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.location_on, color: Colors.black87, size: 18),
+                const SizedBox(width: 4),
+                const Text(
+                  "Kampala",
+                  style: TextStyle(
+                    color: Colors.black87,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              "${ambientTemp.toStringAsFixed(0)}",
+              style: const TextStyle(
+                color: Colors.black87,
+                fontSize: 80,
+                fontWeight: FontWeight.w300,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(top: 15),
+              child: Text(
+                "°",
+                style: TextStyle(
+                  color: Colors.black.withOpacity(0.7),
+                  fontSize: 36,
+                  fontWeight: FontWeight.w300,
+                ),
+              ),
+            ),
+            const SizedBox(width: 16),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const SizedBox(height: 15),
+                Text(
+                  "${maxTemp.toStringAsFixed(0)}° / ${minTemp.toStringAsFixed(0)}°",
+                  style: const TextStyle(color: Colors.black87, fontSize: 18),
+                ),
+                Text(
+                  forecastDays.first.condition,
+                  style: const TextStyle(color: Colors.black87, fontSize: 18),
+                ),
+              ],
+            ),
+            const Spacer(),
+            Padding(
+              padding: const EdgeInsets.only(top: 15),
+              child: Icon(
+                DateTime.now().hour > 6 && DateTime.now().hour < 18
+                    ? Icons.wb_sunny
+                    : Icons.nightlight_round,
+                color: Colors.orange.shade600,
+                size: 40,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHourlyForecast(List<ForecastHour> hourlyForecast) {
+    final nowHour = DateTime.now().hour;
+    final startIndex = hourlyForecast.indexWhere((h) => h.time.hour >= nowHour);
+
+    final startingIndex = startIndex != -1 ? startIndex : 0;
+
+    final nextHours = hourlyForecast.sublist(startingIndex).take(7).toList();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 8.0),
+      decoration: BoxDecoration(
+        color: Colors.green.shade100,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      height: 130,
+      child: ListView.builder(
+        scrollDirection: Axis.horizontal,
+        itemCount: nextHours.length,
+        itemBuilder: (context, index) {
+          final hour = nextHours[index];
+          String timeText = hour.time.hour == nowHour
+              ? "Now"
+              : DateFormat('ha').format(hour.time).toLowerCase();
+
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                Text(
+                  timeText,
+                  style: const TextStyle(color: Colors.black54, fontSize: 12),
+                ),
+                const SizedBox(height: 4),
+                Image.network(
+                  hour.iconUrl,
+                  width: 30,
+                  height: 30,
+                  errorBuilder: (context, error, stackTrace) =>
+                  const Icon(Icons.cloud, color: Colors.green, size: 30),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  "${hour.tempC.toStringAsFixed(0)}°",
+                  style: const TextStyle(
+                    color: Colors.black87,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.water_drop_outlined,
+                      color: Colors.blueGrey,
+                      size: 10,
+                    ),
+                    Text(
+                      "${hour.chanceOfRain.toStringAsFixed(0)}%",
+                      style: const TextStyle(
+                        color: Colors.blueGrey,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildDailyForecastList() {
+    final dailyForecast = forecastDays.take(3).toList();
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 0),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: Colors.green.shade50,
+      ),
+      child: Column(
+        children: dailyForecast.map((day) {
+          String dayName = day.date.day == DateTime.now().day
+              ? "Today"
+              : day.date.day == DateTime.now().add(const Duration(days: 1)).day
+              ? "Tomorrow"
+              : DateFormat('EEEE').format(day.date);
+
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8.0),
+            child: Row(
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: Text(
+                    dayName,
+                    style: const TextStyle(color: Colors.black87, fontSize: 16),
+                  ),
+                ),
+                Expanded(
+                  flex: 3,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Image.network(
+                        day.iconUrl,
+                        width: 25,
+                        height: 25,
+                        errorBuilder: (context, error, stackTrace) =>
+                        const Icon(
+                          Icons.cloud,
+                          color: Colors.green,
+                          size: 25,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        day.condition.split(' ').first,
+                        style: TextStyle(
+                          color: Colors.black.withOpacity(0.8),
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  flex: 2,
+                  child: Text(
+                    "${day.maxTempC.toStringAsFixed(0)}° / ${day.minTempC.toStringAsFixed(0)}°",
+                    textAlign: TextAlign.right,
+                    style: const TextStyle(color: Colors.black87, fontSize: 16),
+                  ),
+                ),
+              ],
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  Widget _buildCombinedInsightBar(double currentAmbientTemp) {
+    return Container(
+      margin: const EdgeInsets.only(top: 16),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.green.shade700,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                "Soil Health: ${soilHealthScore.toStringAsFixed(0)}/100",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              Text(
+                "Ambient: ${currentAmbientTemp.toStringAsFixed(1)}°C | Soil: ${currentTemp.toStringAsFixed(1)}°C",
+                style: const TextStyle(color: Colors.white70, fontSize: 12),
+              ),
+            ],
+          ),
+          ElevatedButton.icon(
+            onPressed: readings.isEmpty
+                ? null
+                : () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => InsightsDashboard(
+                    soilTemp: currentTemp,
+                    tempTrend: tempTrend,
+                  ),
+                ),
+              );
+            },
+            icon: const Icon(Icons.psychology_outlined, size: 18),
+            label: const Text("AI Insights", style: TextStyle(fontSize: 14)),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green.shade500,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAlertsCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: alertMessage?.startsWith('⚠') == true
+            ? Colors.red.shade50
+            : Colors.green.shade50,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(
-          color: isConnected ? Colors.green.shade300 : Colors.orange.shade300,
+          color: alertMessage?.startsWith('⚠') == true
+              ? Colors.red.shade300
+              : Colors.green.shade300,
           width: 2,
         ),
       ),
       child: Row(
         children: [
           Icon(
-            isConnected ? Icons.check_circle : Icons.warning,
-            color: isConnected ? Colors.green.shade700 : Colors.orange.shade700,
+            alertMessage?.startsWith('⚠') == true
+                ? Icons.warning_amber
+                : Icons.notifications_active,
+            color: alertMessage?.startsWith('⚠') == true
+                ? Colors.red.shade700
+                : Colors.green.shade700,
             size: 28,
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  connectionStatus,
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: isConnected
-                        ? Colors.green.shade900
-                        : Colors.orange.shade900,
-                  ),
-                ),
-                if (!isConnected)
-                  const Text(
-                    "Tap Bluetooth icon to connect",
-                    style: TextStyle(fontSize: 12, color: Colors.black54),
-                  ),
-              ],
+            child: Text(
+              alertMessage ?? "No alerts. Soil temperature stable.",
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: Colors.black87,
+              ),
             ),
           ),
-          if (isScanning)
-            const SizedBox(
-              width: 24,
-              height: 24,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
         ],
       ),
     );
@@ -692,6 +903,58 @@ ESP32 Temperature Monitor
                   ),
                 ],
               ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: isConnected ? Colors.green.shade50 : Colors.orange.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isConnected ? Colors.green.shade300 : Colors.orange.shade300,
+          width: 2,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isConnected ? Icons.check_circle : Icons.warning,
+            color: isConnected ? Colors.green.shade700 : Colors.orange.shade700,
+            size: 28,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  connectionStatus,
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: isConnected
+                        ? Colors.green.shade900
+                        : Colors.orange.shade900,
+                  ),
+                ),
+                if (!isConnected)
+                  const Text(
+                    "Tap Bluetooth icon to connect",
+                    style: TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+              ],
+            ),
+          ),
+          if (isScanning)
+            const SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 2),
             ),
         ],
       ),
@@ -845,13 +1108,13 @@ ESP32 Temperature Monitor
 
   Widget _buildChart() {
     if (readings.isEmpty) {
-      return Center(
+      return const Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(Icons.show_chart, size: 48, color: Colors.black26),
-            const SizedBox(height: 8),
-            const Text(
+            SizedBox(height: 8),
+            Text(
               "Waiting for sensor data...",
               style: TextStyle(color: Colors.black38),
             ),
@@ -1088,7 +1351,7 @@ ESP32 Temperature Monitor
               ],
             ),
           ),
-          Icon(Icons.chevron_right, color: Colors.black26),
+          const Icon(Icons.chevron_right, color: Colors.black26),
         ],
       ),
     );
@@ -1110,7 +1373,7 @@ ESP32 Temperature Monitor
   }
 
   // ============================================
-  // BUZZER CONTROL DIALOG
+  // BUZZER CONTROL DIALOG (Unchanged)
   // ============================================
   void _showBuzzerControlDialog() {
     showDialog(
@@ -1169,23 +1432,6 @@ class ListToCsvConverter {
 // ============================================
 // TEMPERATURE READING MODEL
 // ============================================
-class TemperatureReading {
-  final DateTime timestamp;
-  final double temperature;
-
-  TemperatureReading({required this.timestamp, required this.temperature});
-
-  Map<String, dynamic> toJson() => {
-    'timestamp': timestamp.toIso8601String(),
-    'temperature': temperature,
-  };
-
-  factory TemperatureReading.fromJson(Map<String, dynamic> json) =>
-      TemperatureReading(
-        timestamp: DateTime.parse(json['timestamp']),
-        temperature: json['temperature'].toDouble(),
-      );
-}
 
 // ============================================
 // CHART DATA MODEL
@@ -1233,6 +1479,9 @@ class HistoryScreen extends StatelessWidget {
                         final prefs = await SharedPreferences.getInstance();
                         await prefs.remove('temperature_readings');
 
+                        // NOTE: We need to tell the manager to clear its list too.
+                        BluetoothManager().readings.clear();
+
                         Navigator.pop(context);
                         Navigator.pop(context);
 
@@ -1257,61 +1506,64 @@ class HistoryScreen extends StatelessWidget {
       ),
       body: readings.isEmpty
           ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.history, size: 64, color: Colors.black26),
-                  SizedBox(height: 16),
-                  Text(
-                    'No readings yet',
-                    style: TextStyle(fontSize: 18, color: Colors.black38),
-                  ),
-                  SizedBox(height: 8),
-                  Text(
-                    'Connect your sensor to start collecting data',
-                    style: TextStyle(fontSize: 14, color: Colors.black38),
-                  ),
-                ],
-              ),
-            )
-          : ListView.builder(
-              padding: const EdgeInsets.all(16),
-              itemCount: readings.length,
-              itemBuilder: (context, index) {
-                final reading = readings.reversed.toList()[index];
-                final tempColor = reading.temperature > 25
-                    ? Colors.orange
-                    : reading.temperature < 18
-                    ? Colors.blue
-                    : Colors.green;
-
-                return Card(
-                  margin: const EdgeInsets.only(bottom: 8),
-                  child: ListTile(
-                    leading: Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: tempColor.withOpacity(0.2),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Icon(Icons.thermostat, color: tempColor),
-                    ),
-                    title: Text(
-                      '${reading.temperature.toStringAsFixed(2)}°C',
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    subtitle: Text(
-                      reading.timestamp.toString().split('.')[0],
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    trailing: Icon(Icons.chevron_right, color: Colors.black26),
-                  ),
-                );
-              },
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.history, size: 64, color: Colors.black26),
+            SizedBox(height: 16),
+            Text(
+              'No readings yet',
+              style: TextStyle(fontSize: 18, color: Colors.black38),
             ),
+            SizedBox(height: 8),
+            Text(
+              'Connect your sensor to start collecting data',
+              style: TextStyle(fontSize: 14, color: Colors.black38),
+            ),
+          ],
+        ),
+      )
+          : ListView.builder(
+        padding: const EdgeInsets.all(16),
+        itemCount: readings.length,
+        itemBuilder: (context, index) {
+          final reading = readings.reversed.toList()[index];
+          final tempColor = reading.temperature > 25
+              ? Colors.orange
+              : reading.temperature < 18
+              ? Colors.blue
+              : Colors.green;
+
+          return Card(
+            margin: const EdgeInsets.only(bottom: 8),
+            child: ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: tempColor.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(Icons.thermostat, color: tempColor),
+              ),
+              title: Text(
+                '${reading.temperature.toStringAsFixed(2)}°C',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              subtitle: Text(
+                reading.timestamp.toString().split('.')[0],
+                style: const TextStyle(fontSize: 12),
+              ),
+              trailing: const Icon(
+                Icons.chevron_right,
+                color: Colors.black26,
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 }

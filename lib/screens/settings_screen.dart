@@ -1,8 +1,14 @@
 // lib/screens/settings_screen.dart
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../main.dart'; // Import for ThemeProvider
-import '../widgets/sidebar_menu.dart'; // Added SidebarMenu import
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:url_launcher/url_launcher.dart';
+import '../main.dart';
+import '../widgets/sidebar_menu.dart';
+import '../services/bluetooth_manager.dart';
+import '../widgets/chatbot_widget.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -11,16 +17,69 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with WidgetsBindingObserver {
+  final BluetoothManager _bluetoothManager = BluetoothManager();
+  final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+  final AudioPlayer _audioPlayer = AudioPlayer();
+
   bool notificationsEnabled = true;
   bool soundEnabled = true;
   double temperatureThreshold = 30.0;
-  double humidityThreshold = 70.0;
+  DateTime? _lastAlertTime;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _initializeNotifications();
     _loadSettings();
+    _startMonitoringSensor();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      setState(() {});
+    }
+  }
+
+  bool get isConnected => _bluetoothManager.isConnected;
+  BluetoothDevice? get connectedDevice => _bluetoothManager.connectedDevice;
+
+  Future<void> _initializeNotifications() async {
+    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosSettings = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+
+    const initSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: iosSettings,
+    );
+
+    await _notificationsPlugin.initialize(initSettings);
+
+    // Request permissions
+    await _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+
+    await _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+            IOSFlutterLocalNotificationsPlugin>()
+        ?.requestPermissions(alert: true, badge: true, sound: true);
   }
 
   Future<void> _loadSettings() async {
@@ -29,7 +88,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       notificationsEnabled = prefs.getBool('notifications') ?? true;
       soundEnabled = prefs.getBool('sound') ?? true;
       temperatureThreshold = prefs.getDouble('tempThreshold') ?? 30.0;
-      humidityThreshold = prefs.getDouble('humidityThreshold') ?? 70.0;
     });
   }
 
@@ -42,25 +100,127 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  void _startMonitoringSensor() {
+    // Monitor sensor data from BluetoothManager
+    _bluetoothManager.temperatureStream.listen((temperature) {
+      _checkTemperatureAlert(temperature);
+    });
+  }
+
+  void _checkTemperatureAlert(double temperature) {
+    if (!notificationsEnabled) return;
+
+    // Check if temperature exceeds threshold
+    if (temperature > temperatureThreshold) {
+      // Prevent alert spam - only alert once every 5 minutes
+      final now = DateTime.now();
+      if (_lastAlertTime == null ||
+          now.difference(_lastAlertTime!).inMinutes >= 5) {
+        _lastAlertTime = now;
+        _triggerAlert(
+          'Temperature Alert',
+          'Temperature is ${temperature.toStringAsFixed(1)}°C (threshold: ${temperatureThreshold.toStringAsFixed(0)}°C)',
+        );
+      }
+    }
+  }
+
+  Future<void> _triggerAlert(String title, String message) async {
+    // Play sound if enabled
+    if (soundEnabled) {
+      try {
+        await _audioPlayer.play(AssetSource('sounds/alert.mp3'));
+      } catch (e) {
+        debugPrint('Error playing sound: $e');
+      }
+    }
+
+    // Show notification
+    const androidDetails = AndroidNotificationDetails(
+      'temperature_alerts',
+      'Temperature Alerts',
+      channelDescription: 'Alerts for temperature threshold exceeded',
+      importance: Importance.high,
+      priority: Priority.high,
+      playSound: true,
+      enableVibration: true,
+    );
+
+    const iosDetails = DarwinNotificationDetails(
+      presentAlert: true,
+      presentBadge: true,
+      presentSound: true,
+    );
+
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: iosDetails,
+    );
+
+    await _notificationsPlugin.show(
+      0,
+      title,
+      message,
+      details,
+    );
+  }
+
+  Future<void> _showTestNotification() async {
+    await _triggerAlert(
+      'Test Notification',
+      'Notifications are working correctly!',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final themeProvider = ThemeProvider.of(context);
     final isDarkMode = themeProvider.isDarkMode;
 
     return Scaffold(
-      drawer: const SidebarMenu(), // Added drawer
+      drawer: const SidebarMenu(),
       appBar: AppBar(
         leading: Builder(
           builder: (context) => IconButton(
             icon: const Icon(Icons.menu),
             onPressed: () {
-              Scaffold.of(context).openDrawer(); // Open drawer
+              Scaffold.of(context).openDrawer();
             },
           ),
         ),
         title: const Text('Settings'),
         elevation: 0,
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 16.0),
+            child: Center(
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    isConnected
+                        ? Icons.bluetooth_connected
+                        : Icons.bluetooth_disabled,
+                    color: isConnected ? Colors.green : Colors.red,
+                    size: 20,
+                  ),
+                  if (isConnected && connectedDevice != null) ...[
+                    const SizedBox(width: 4),
+                    Text(
+                      'Connected',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.green.shade100,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
+      floatingActionButton: const ChatbotFAB(),
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
@@ -76,6 +236,80 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            // Bluetooth Connection Status
+            if (isConnected && connectedDevice != null)
+              Container(
+                margin: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.green.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.green.shade200),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.check_circle,
+                      color: Colors.green.shade700,
+                      size: 24,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Device Connected',
+                            style: TextStyle(
+                              color: Colors.green.shade900,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            connectedDevice?.platformName ?? 'ESP32 Sensor',
+                            style: TextStyle(
+                              color: Colors.green.shade700,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.green.shade100,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.circle,
+                            size: 8,
+                            color: Colors.green.shade700,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Active',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.green.shade700,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
             // Appearance Section
             _buildSectionTitle('Appearance'),
             _buildSettingsCard(
@@ -93,8 +327,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 _buildSoundTile(),
                 const Divider(height: 1),
                 _buildTemperatureThresholdTile(),
-                const Divider(height: 1),
-                _buildHumidityThresholdTile(),
               ],
             ),
 
@@ -277,11 +509,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // All other helper widgets (_buildSectionTitle, _buildSettingsCard, _buildThemeTile, etc.)
-  // and dialogs remain unchanged.
-
-
-
   Widget _buildSectionTitle(String title) {
     return Padding(
       padding: const EdgeInsets.only(left: 4, bottom: 12),
@@ -375,15 +602,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
         style: TextStyle(fontWeight: FontWeight.w600),
       ),
       subtitle: const Text('Receive alerts for temperature changes'),
-      trailing: Switch(
-        value: notificationsEnabled,
-        onChanged: (value) {
-          setState(() {
-            notificationsEnabled = value;
-          });
-          _saveSetting('notifications', value);
-        },
-        activeColor: Theme.of(context).primaryColor,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (notificationsEnabled)
+            IconButton(
+              icon: const Icon(Icons.play_arrow, size: 20),
+              onPressed: _showTestNotification,
+              tooltip: 'Test notification',
+            ),
+          Switch(
+            value: notificationsEnabled,
+            onChanged: (value) async {
+              setState(() {
+                notificationsEnabled = value;
+              });
+              await _saveSetting('notifications', value);
+              if (value) {
+                await _showTestNotification();
+              }
+            },
+            activeColor: Theme.of(context).primaryColor,
+          ),
+        ],
       ),
     );
   }
@@ -451,43 +692,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               temperatureThreshold = value;
             });
             _saveSetting('tempThreshold', value);
-          },
-        );
-      },
-    );
-  }
-
-  Widget _buildHumidityThresholdTile() {
-    return ListTile(
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      leading: Container(
-        padding: const EdgeInsets.all(8),
-        decoration: BoxDecoration(
-          color: Colors.blue.shade100,
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Icon(Icons.water_drop, color: Colors.blue.shade700),
-      ),
-      title: const Text(
-        'Humidity Alert',
-        style: TextStyle(fontWeight: FontWeight.w600),
-      ),
-      subtitle: Text(
-        'Alert when exceeding ${humidityThreshold.toStringAsFixed(0)}%',
-      ),
-      trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-      onTap: () {
-        _showThresholdDialog(
-          title: 'Humidity Threshold',
-          currentValue: humidityThreshold,
-          unit: '%',
-          min: 0,
-          max: 100,
-          onSave: (value) {
-            setState(() {
-              humidityThreshold = value;
-            });
-            _saveSetting('humidityThreshold', value);
           },
         );
       },
@@ -607,7 +811,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const Text('Version 1.0.0'),
             const SizedBox(height: 16),
             const Text(
-              'A professional soil monitoring application for tracking temperature, humidity, and other soil conditions via ESP32 sensors.',
+              'A professional soil monitoring application for tracking temperature and other soil conditions via ESP32 sensors.',
               style: TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 16),
@@ -619,6 +823,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const Text('• Real-time temperature monitoring'),
             const Text('• Bluetooth ESP32 connectivity'),
             const Text('• Custom alert thresholds'),
+            const Text('• Push notifications & sound alerts'),
             const Text('• Data export capabilities'),
             const Text('• Dark mode support'),
             const SizedBox(height: 16),
@@ -662,9 +867,35 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            _buildHelpItem(Icons.email, 'Email', 'support@soilsensor.com'),
-            _buildHelpItem(Icons.bug_report, 'Report Bug', 'Send feedback'),
-            _buildHelpItem(Icons.book, 'Documentation', 'View user guide'),
+            _buildHelpItem(
+              Icons.email,
+              'Email Support',
+              'noelaankunda2@gmail.com',
+              () => _launchEmail('noelaankunda2@gmail.com'),
+            ),
+            _buildHelpItem(
+              Icons.bug_report,
+              'Report Bug',
+              'Send feedback',
+              () => _launchEmail(
+                'support@soilsensor.com',
+                subject: 'Bug Report',
+              ),
+            ),
+            _buildHelpItem(
+              Icons.book,
+              'Documentation',
+              'View user guide',
+              () {
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Documentation coming soon!'),
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+              },
+            ),
           ],
         ),
         actions: [
@@ -677,38 +908,72 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildHelpItem(IconData icon, String title, String subtitle) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        children: [
-          Icon(
-            icon,
-            size: 20,
-            color: Theme.of(context).textTheme.bodySmall?.color,
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-                Text(
-                  subtitle,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Theme.of(context).textTheme.bodySmall?.color,
-                  ),
-                ),
-              ],
+  Widget _buildHelpItem(
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback onTap,
+  ) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              size: 20,
+              color: Theme.of(context).primaryColor,
             ),
-          ),
-        ],
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Theme.of(context).textTheme.bodySmall?.color,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(
+              Icons.arrow_forward_ios,
+              size: 14,
+              color: Theme.of(context).textTheme.bodySmall?.color,
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  Future<void> _launchEmail(String email, {String? subject}) async {
+    final uri = Uri(
+      scheme: 'mailto',
+      path: email,
+      query: subject != null ? 'subject=$subject' : null,
+    );
+
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri);
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not open email app. Email: $email'),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
   }
 
   void _showExportDialog() {

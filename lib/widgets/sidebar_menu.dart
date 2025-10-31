@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class SidebarMenu extends StatelessWidget {
   const SidebarMenu({super.key});
@@ -91,15 +92,7 @@ class SidebarMenu extends StatelessWidget {
                         isActive: currentRoute == '/',
                         color: Colors.green,
                       ),
-                      const SizedBox(height: 8),
-                      _buildMenuItem(
-                        context,
-                        icon: Icons.bluetooth_rounded,
-                        title: "Device Connection",
-                        route: '/device',
-                        isActive: currentRoute == '/device',
-                        color: Colors.blue,
-                      ),
+
                       const SizedBox(height: 8),
                       _buildMenuItem(
                         context,
@@ -315,19 +308,49 @@ class SidebarMenu extends StatelessWidget {
             _buildHelpItem(
               Icons.email_rounded,
               'Email Support',
-              'support@soilsensor.com',
+              'noelaankunda@gmail.com',
+              () async {
+                final Uri emailUri = Uri(
+                  scheme: 'mailto',
+                  path: 'noelaankunda@gmail.com',
+                );
+                if (await canLaunchUrl(emailUri)) {
+                  await launchUrl(emailUri, mode: LaunchMode.externalApplication);
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('No email app found on this device'),
+                    ),
+                  );
+                }
+              },
             ),
             const SizedBox(height: 12),
             _buildHelpItem(
               Icons.bug_report_rounded,
               'Report a Bug',
               'Help us improve',
+              () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Bug report clicked')),
+                );
+              },
             ),
             const SizedBox(height: 12),
             _buildHelpItem(
               Icons.book_rounded,
               'Documentation',
               'View user guide',
+              () async {
+                final Uri docUrl = Uri.parse('https://your.documentation.url');
+                if (await canLaunchUrl(docUrl)) {
+                  await launchUrl(docUrl, mode: LaunchMode.externalApplication);
+                } else {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Cannot open documentation')),
+                  );
+                }
+              },
             ),
           ],
         ),
@@ -348,30 +371,38 @@ class SidebarMenu extends StatelessWidget {
     );
   }
 
-  Widget _buildHelpItem(IconData icon, String title, String subtitle) {
-    return Row(
-      children: [
-        Icon(icon, size: 20, color: Colors.grey.shade600),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: const TextStyle(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 14,
-                ),
+  Widget _buildHelpItem(
+      IconData icon, String title, String subtitle, VoidCallback? onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Icon(icon, size: 20, color: Colors.grey.shade600),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                  ),
+                ],
               ),
-              Text(
-                subtitle,
-                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
-              ),
-            ],
-          ),
+            ),
+          ],
         ),
-      ],
+      ),
     );
   }
 

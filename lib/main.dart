@@ -1,3 +1,5 @@
+// lib/main.dart
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -156,7 +158,7 @@ class _SoilTempAppShellState extends State<SoilTempAppShell> {
             initialRoute: '/',
             routes: {
               '/': (context) => const DashboardScreen(),
-              '/device': (context) => const BluetoothHome(),
+              '/bluetooth': (context) => const BluetoothHome(),
               '/soil': (context) => const SoilDataScreen(),
               '/settings': (context) => const SettingsScreen(),
             },
@@ -229,8 +231,8 @@ class ThemeProvider extends InheritedWidget {
   });
 
   static ThemeProvider of(BuildContext context) {
-    final ThemeProvider? result = context
-        .dependOnInheritedWidgetOfExactType<ThemeProvider>();
+    final ThemeProvider? result =
+        context.dependOnInheritedWidgetOfExactType<ThemeProvider>();
     assert(result != null, 'No ThemeProvider found in context');
     return result!;
   }
@@ -242,9 +244,8 @@ class ThemeProvider extends InheritedWidget {
 
   // Helper method to toggle theme
   void toggleTheme() {
-    final newMode = themeMode == ThemeMode.light
-        ? ThemeMode.dark
-        : ThemeMode.light;
+    final newMode =
+        themeMode == ThemeMode.light ? ThemeMode.dark : ThemeMode.light;
     onThemeChanged(newMode);
   }
 
